@@ -195,7 +195,7 @@ _PackedPoses _separatePoses(_PoseJob job) {
   final labels = Int32List(gw * gh);
   for (var y = 0; y < h; y++) {
     for (var x = 0; x < w; x++) {
-      if (src[(y * w + x) * 4 + 3] >= 16) labels[(y >> 1) * gw + (x >> 1)] = -1;
+      if (src[(y * w + x) * 4 + 3] >= 96) labels[(y >> 1) * gw + (x >> 1)] = -1;
     }
   }
   // Which frame each blob belongs to: the cell holding its centre. Some
@@ -236,9 +236,13 @@ _PackedPoses _separatePoses(_PoseJob job) {
     owner.add(row.clamp(0, rows - 1) * cols + col.clamp(0, cols - 1));
   }
 
+  // Soft pixels (trails, glow) do not join blobs, so they cannot fuse two
+  // poses together; they stay with the grid cell they sit in.
   int frameOf(int x, int y) {
     final label = labels[(y >> 1) * gw + (x >> 1)];
-    return label <= 0 ? -1 : owner[label];
+    if (label > 0) return owner[label];
+    return math.min(rows - 1, y ~/ cellH) * cols +
+        math.min(cols - 1, x ~/ cellW);
   }
 
   final count = cols * rows;

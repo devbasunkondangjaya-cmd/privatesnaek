@@ -1964,9 +1964,14 @@ class VenomcoilGame extends FlameGame with KeyboardEvents {
   void _hurt({bool fatal = false}) {
     if (_invulnerable > 0 || _dead) return;
     _hearts = fatal ? 0 : _hearts - 1;
-    // A big boss defeat returns to the first checkpoint of its theme.
+    // Losing to a big boss returns to the first checkpoint of its theme. Only
+    // a death inside the boss fight counts; dying earlier in the level keeps
+    // the normal checkpoint respawn.
     final id = (_level['id'] as num).toInt();
-    if (_hearts <= 0 && (id == 15 || id == 20)) {
+    final inBossFight = _enemies.any(
+      (enemy) => enemy.boss && enemy.active && (enemy.x - _playerX).abs() < 820,
+    );
+    if (_hearts <= 0 && (id == 15 || id == 20) && inBossFight) {
       _bossWipe = true;
       _persist(area: (_area ~/ 5) * 5, checkpoint: 1);
     }
