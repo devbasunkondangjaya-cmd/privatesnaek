@@ -34,7 +34,7 @@ class VenomcoilApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'Venomcoil',
+      title: 'Venociol Snake',
       debugShowCheckedModeBanner: false,
       theme: ThemeData(
         brightness: Brightness.dark,

@@ -1,11 +1,11 @@
 {
-    "name": "Venomcoil",
-    "short_name": "Venomcoil",
+    "name": "Venociol Snake",
+    "short_name": "Venociol Snake",
     "start_url": ".",
     "display": "standalone",
     "background_color": "#08231f",
     "theme_color": "#08231f",
-    "description": "Venomcoil - petualangan ular 20 area",
+    "description": "Venociol Snake - petualangan ular 20 area",
     "orientation": "landscape",
     "prefer_related_applications": false,
     "icons": [

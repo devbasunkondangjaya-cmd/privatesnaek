@@ -222,9 +222,9 @@ class _Title extends StatelessWidget {
         alignment: Alignment.center,
         children: [
           Text(
-            'VENOMCOIL',
+            'VENOCIOL SNAKE',
             style: TextStyle(
-              fontSize: 46,
+              fontSize: 30,
               fontWeight: FontWeight.w900,
               letterSpacing: 3,
               height: 1,
@@ -236,10 +236,10 @@ class _Title extends StatelessWidget {
             ),
           ),
           const GradientText(
-            'VENOMCOIL',
+            'VENOCIOL SNAKE',
             colors: [Color(0xfffff3a8), Color(0xff9bf07a), Color(0xff2fa04a)],
             style: TextStyle(
-              fontSize: 46,
+              fontSize: 30,
               fontWeight: FontWeight.w900,
               letterSpacing: 3,
               height: 1,
