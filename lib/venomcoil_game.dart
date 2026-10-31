@@ -8,6 +8,7 @@ import 'package:flutter/services.dart';
 import 'package:flutter/widgets.dart';
 
 import 'audio_manager.dart';
+import 'fx_kit.dart';
 import 'image_store.dart';
 import 'level_data.dart';
 import 'save_data.dart';
@@ -95,8 +96,6 @@ const _expansionPuzzleData = <List<List<Object>>>[
 class GameHudState {
   const GameHudState({
     this.hearts = 3,
-    this.momentum = 0,
-    this.coilCharge = 0,
     this.area = 1,
     this.areaName = 'Canopy Roots',
     this.lesson = '',
@@ -113,14 +112,32 @@ class GameHudState {
     this.savedCheckpoint = 0,
     this.bossWipe = false,
     this.hurtCount = 0,
+    this.loading = false,
+    this.overMenu = false,
+    this.intro = 0,
+    this.bossHp = 0,
+    this.bossMaxHp = 0,
+    this.bossName = '',
   });
 
   /// Bumps on every hit so the HUD can shake the hearts.
   final int hurtCount;
 
+  /// An area's art is being swapped; the loading veil covers the screen.
+  final bool loading;
+
+  /// The open popup was reached from the title screen, not from a run.
+  final bool overMenu;
+
+  /// Bumps when a run begins, so the area title card plays once.
+  final int intro;
+
+  /// Health of the boss in range; [bossMaxHp] is 0 when none is near.
+  final int bossHp;
+  final int bossMaxHp;
+  final String bossName;
+
   final int hearts;
-  final double momentum;
-  final double coilCharge;
   final int area;
   final String areaName;
   final String lesson;
@@ -141,6 +158,39 @@ class GameHudState {
 
   /// Venom is unlocked from area 2 onward.
   bool get canVenom => area >= 2;
+
+  // Value equality: publishing an unchanged state notifies no listener, so an
+  // idle or paused game costs the widget tree nothing. Sets and maps compare
+  // by identity because the game only replaces them when they really change.
+  @override
+  bool operator ==(Object other) =>
+      other is GameHudState &&
+      other.hearts == hearts &&
+      other.elapsed == elapsed &&
+      other.progress == progress &&
+      other.overlay == overlay &&
+      other.area == area &&
+      other.areaName == areaName &&
+      other.lesson == lesson &&
+      other.hint == hint &&
+      other.skinIndex == skinIndex &&
+      other.checkpoint == checkpoint &&
+      identical(other.completed, completed) &&
+      identical(other.bestTimes, bestTimes) &&
+      other.hasProgress == hasProgress &&
+      other.savedArea == savedArea &&
+      other.savedCheckpoint == savedCheckpoint &&
+      other.bossWipe == bossWipe &&
+      other.hurtCount == hurtCount &&
+      other.loading == loading &&
+      other.overMenu == overMenu &&
+      other.intro == intro &&
+      other.bossHp == bossHp &&
+      other.bossMaxHp == bossMaxHp &&
+      other.bossName == bossName;
+
+  @override
+  int get hashCode => Object.hash(overlay, area, hearts, elapsed, progress);
 }
 
 class _Platform {
@@ -251,11 +301,12 @@ class _Enemy {
     this.boss = false,
     this.hp = 1,
     this.opens,
-  });
+  }) : maxHp = hp;
 
   double x;
   double y;
   double direction = 1;
+  final int maxHp;
   final String type;
   final bool boss;
   final String? opens;
@@ -325,14 +376,50 @@ class VenomcoilGame extends FlameGame with KeyboardEvents {
   ui.Color backgroundColor() => const ui.Color(0xff082f2c);
 
   final ValueNotifier<GameHudState> hud = ValueNotifier(const GameHudState());
+
+  // Per-frame readouts. Each drives one small painter directly, so moving
+  // bars and cooldown sweeps never rebuild a widget.
+  final ValueNotifier<double> momentumMeter = ValueNotifier(0);
+  final ValueNotifier<double> coilMeter = ValueNotifier(0);
+  final ValueNotifier<double> attackCooldownMeter = ValueNotifier(0);
+  final ValueNotifier<double> venomCooldownMeter = ValueNotifier(0);
   final ImageStore _store = ImageStore.instance;
   final GameAudio _audio = GameAudio.instance;
   final Map<_Platform, ui.Picture> _platformPictures = {};
   final List<_Effect> _effects = [];
   final List<_VenomBurst> _venomBursts = [];
   final List<_Scenery> _scenery = [];
+  final ParticlePool _particles = ParticlePool(220);
+  late final GlowBatch _glows = GlowBatch(360);
+  late final GlowBatch _shadows = GlowBatch(40);
+  final ui.Paint _glowPaint = ui.Paint()
+    ..blendMode = ui.BlendMode.plus
+    ..filterQuality = ui.FilterQuality.low;
+  final ui.Paint _shadowPaint = ui.Paint()
+    ..filterQuality = ui.FilterQuality.low;
+  double _shake = 0;
+  ui.Color _groundColor = const ui.Color(0xff082f2c);
+  ui.Color _primaryColor = const ui.Color(0xff2dd66f);
+  ui.Color _accentColor = const ui.Color(0xffffd76a);
+  ui.Size _shadedSize = ui.Size.zero;
+  final ui.Paint _gradePaint = ui.Paint();
+  final ui.Paint _vignettePaint = ui.Paint();
+  final List<double> _checkpointYs = [];
+  _Hazard? _exitGate;
+  final List<_Enemy> _bosses = [];
   Set<String> _stageFiles = {};
   Set<String> _skinSheetFiles = {};
+
+  /// True while a run's art is loaded; false on the title screen, which holds
+  /// only its backdrop, the skin preview and the HUD icons.
+  bool _inStage = false;
+  bool _loading = false;
+  bool _needsFrame = false;
+  bool _introPending = false;
+  int _intro = 0;
+  String? _lastTrack;
+  Set<int> _completedView = const {};
+  Map<int, double> _bestView = const {};
   Future<void> _areaTransition = Future.value();
   Future<void> _skinTransition = Future.value();
   String? _tileFile;
@@ -418,29 +505,117 @@ class VenomcoilGame extends FlameGame with KeyboardEvents {
     projectiles: _shots.length,
   );
 
-  static const _sharedFxFiles = <String>[
+  @visibleForTesting
+  void debugKillPlayer() {
+    _invulnerable = 0;
+    _hurt(fatal: true);
+  }
+
+  static const _lessonShown = 3.0;
+  static const _titleCardTime = 2.4;
+
+  static const _coreFxFiles = <String>[
     'fx_core-transparent.webp',
     'fx_impacts-transparent.webp',
-    'fx_final-transparent.webp',
-    'fx_world_a-transparent.webp',
-    'fx_world_b-transparent.webp',
-    'fx_world_c-transparent.webp',
   ];
+
+  /// Which shared sheet each hazard type draws from (see [_hazardSpec]).
+  static const _sharedSheetFor = <String, String>{
+    'wall': _impactsFile,
+    'venomWall': _worldCFile,
+    'iceWall': _worldCFile,
+    'block': _worldCFile,
+    'gate': _finalFile,
+    'puzzleGate': _finalFile,
+    'pillar': _finalFile,
+    'mushroom': _worldBFile,
+    'venomSwitch': _worldBFile,
+    'wind': _worldAFile,
+    'updraft': _worldAFile,
+    'ceiling': _worldAFile,
+  };
+
+  // Type groups looked up every frame; const sets avoid allocating a list for
+  // each hazard on each check.
+  static const _airCurrents = {'wind', 'updraft'};
+  static const _solidTypes = {
+    'wall',
+    'venomWall',
+    'gate',
+    'puzzleGate',
+    'iceWall',
+    'pillar',
+  };
+  static const _venomTargets = {
+    'venomWall',
+    'iceWall',
+    'switch',
+    'venomSwitch',
+    'momentumSwitch',
+    'cocoon',
+  };
+
+  static const _bossNames = {
+    'scorpion': 'Kalajengking Kaca',
+    'sentinel': 'Sentinel Inti',
+    'prism_leviathan': 'Leviathan Prisma',
+    'world_serpent': 'Ular Dunia',
+  };
 
   @override
   Future<void> onLoad() async {
     await super.onLoad();
     _levels = campaignLevels;
     _skinIndex = save.skin.clamp(0, skinNames.length - 1);
-    await Future.wait([
-      _store.loadSheet('hud_atlas-transparent.webp', cols: 4, rows: 3),
-      _store.loadSheet('prop_valve_anim-transparent.webp', cols: 3, rows: 2),
-      for (final file in _sharedFxFiles)
-        _store.loadSheet(file, cols: 5, rows: 4),
-      _loadSkinSheets(_skinIndex),
-    ]);
-    await selectArea(save.area, checkpoint: save.checkpoint, run: false);
+    _refreshSaveViews();
+    await _store.loadSheet('hud_atlas-transparent.webp', cols: 4, rows: 3);
+    await _enterMenuStage(save.area);
     showMenu();
+  }
+
+  void _refreshSaveViews() {
+    _completedView = Set.unmodifiable(save.completed);
+    _bestView = Map.unmodifiable(save.bestTimes);
+  }
+
+  /// Unloads the run and keeps only what the title screen shows.
+  Future<void> _enterMenuStage(int index) {
+    final transition = _areaTransition.then((_) async {
+      if (_overlay != 'menu' && _inStage) return;
+      _inStage = false;
+      _area = index.clamp(0, _levels.length - 1);
+      _level = _levels[_area] as Map<String, dynamic>;
+      _clearStageObjects();
+      _hearts = 3;
+      _checkpoint = 0;
+      _elapsed = 0;
+      _playerX = 120;
+      final bg = _level['bg'] as String;
+      _store.release(_stageFiles.difference({bg}));
+      _stageFiles = {bg};
+      await _store.loadSheet(bg);
+      await _loadSkinSheets(_skinIndex);
+      _setHud();
+    });
+    _areaTransition = transition.catchError((Object _) {});
+    return transition;
+  }
+
+  void _clearStageObjects() {
+    _clearPlatformPictures();
+    _platforms.clear();
+    _hazards.clear();
+    _enemies.clear();
+    _bosses.clear();
+    _exitGate = null;
+    _shots.clear();
+    _bossShots.clear();
+    _effects.clear();
+    _venomBursts.clear();
+    _scenery.clear();
+    _particles.clear();
+    _checkpointXs.clear();
+    _checkpointYs.clear();
   }
 
   /// The "_b" boss sheets are shorter grids than the 5x4 "_a" sheets; slicing
@@ -453,24 +628,17 @@ class VenomcoilGame extends FlameGame with KeyboardEvents {
   static String _skinFile(int skin, String kind) =>
       'skin_${(skin + 1).toString().padLeft(2, '0')}_$kind-transparent.webp';
 
-  /// Loads every sheet of one skin (movement, combat, reactions, outcomes and
-  /// its own fx) and frees the previous skin's sheets.
+  /// Loads the sheets one skin actually draws and frees the previous skin's:
+  /// its movement poses always, its own fx only while a run needs them.
   Future<void> _loadSkinSheets(int skin) async {
     final next = <String>{};
-    Future<void> add(String kind, {int rows = 4}) async {
+    Future<void> add(String kind) async {
       final file = _skinFile(skin, kind);
       next.add(file);
-      await _store.loadSheet(file, cols: 5, rows: rows);
+      await _store.loadSheet(file, cols: 5, rows: 4);
     }
 
-    await Future.wait([
-      add('motion_a'),
-      add('motion_b'),
-      add('combat'),
-      add('reactions'),
-      add('outcomes', rows: 2),
-      add('fx'),
-    ]);
+    await Future.wait([add('motion_a'), if (_inStage) add('fx')]);
     if (_store.sheet(_skinFile(skin, 'motion_a')) == null) {
       await _store.loadSheet(
         'vexa_motion_a-transparent.webp',
@@ -485,9 +653,11 @@ class VenomcoilGame extends FlameGame with KeyboardEvents {
         : 'fx_core-transparent.webp';
   }
 
-  /// Loads the art that belongs to one area and frees the previous area's.
-  Future<void> _loadStageImages(int index) async {
-    final stage = _levels[index] as Map<String, dynamic>;
+  /// Loads only the art the current area uses, and frees the previous area's
+  /// first so the two never sit in memory together. Needs the geometry built:
+  /// shared sheets are skipped when no object of the area draws from them.
+  Future<void> _loadStageImages() async {
+    final stage = _level;
     final id = (stage['id'] as num).toInt();
     final nn = id.toString().padLeft(2, '0');
     final bg = stage['bg'] as String;
@@ -503,6 +673,13 @@ class VenomcoilGame extends FlameGame with KeyboardEvents {
         : id == 5 || id == 10
         ? [enemy.replaceFirst('_a-', '_b-')]
         : const <String>[];
+    final sharedFx = <String>{..._coreFxFiles};
+    var usesValve = false;
+    for (final hazard in _hazards) {
+      final sheet = _sharedSheetFor[hazard.type];
+      if (sheet != null) sharedFx.add(sheet);
+      usesValve = usesValve || _isValve(hazard);
+    }
     final next = <String>{
       bg,
       ?tiles,
@@ -511,7 +688,12 @@ class VenomcoilGame extends FlameGame with KeyboardEvents {
       expFx,
       enemy,
       ...bosses,
+      ...sharedFx,
+      if (usesValve) _valveFile,
     };
+    _store.release(_stageFiles.difference(next));
+    _stageFiles = next;
+    _inStage = true;
     await Future.wait([
       _store.loadSheet(bg),
       if (tiles != null) _store.loadSheet(tiles),
@@ -521,9 +703,10 @@ class VenomcoilGame extends FlameGame with KeyboardEvents {
       _store.loadSheet(enemy, cols: 5, rows: 4),
       for (final boss in bosses)
         _store.loadSheet(boss, cols: 5, rows: _bossSheetRows(boss)),
+      for (final file in sharedFx) _store.loadSheet(file, cols: 5, rows: 4),
+      if (usesValve) _store.loadSheet(_valveFile, cols: 3, rows: 2),
+      _loadSkinSheets(_skinIndex),
     ]);
-    _store.release(_stageFiles.difference(next));
-    _stageFiles = next;
     _tileFile = tiles;
     _enemyFile = enemy;
     _expFxFile = expFx;
@@ -832,22 +1015,29 @@ class VenomcoilGame extends FlameGame with KeyboardEvents {
   }) async {
     if (_levels.isEmpty) return;
     _paused = true;
-    final nextArea = index.clamp(0, _levels.length - 1);
-    await _loadStageImages(nextArea);
-    _area = nextArea;
+    _loading = true;
+    _area = index.clamp(0, _levels.length - 1);
     _level = _levels[_area] as Map<String, dynamic>;
-    _clearPlatformPictures();
-    _platforms.clear();
-    _hazards.clear();
-    _enemies.clear();
-    _shots.clear();
-    _bossShots.clear();
+    _clearStageObjects();
+    _setHud();
     _bossWipe = false;
-    _effects.clear();
-    _venomBursts.clear();
+    _dead = false;
+    _completed = false;
     _buildAreaGeometry();
     _buildCheckpoints();
-    _cachePlatformPictures((_level['palette'] as List<dynamic>).cast<String>());
+    final palette = (_level['palette'] as List<dynamic>).cast<String>();
+    _groundColor = _parseColor(palette[0]);
+    _primaryColor = _parseColor(palette[1]);
+    _accentColor = _parseColor(palette[2]);
+    _shadedSize = ui.Size.zero;
+    _bosses.addAll(_enemies.where((enemy) => enemy.boss));
+    for (final hazard in _hazards) {
+      if (hazard.type == 'puzzleGate' && hazard.x >= _length - 400) {
+        _exitGate = hazard;
+        break;
+      }
+    }
+    await _loadStageImages();
     _buildScenery();
     final spawn = _level['spawn'] as List<dynamic>;
     final restore = checkpoint > 0 && checkpoint <= _checkpointXs.length;
@@ -887,14 +1077,16 @@ class VenomcoilGame extends FlameGame with KeyboardEvents {
     _resumedFromSave = restore;
     if (restore) _restorePuzzlesBefore(startX);
     _invulnerable = 0;
+    _shake = 0;
     _started = false;
-    _dead = false;
-    _completed = false;
     _paused = !run;
+    _introPending = true;
+    _needsFrame = true;
+    _loading = false;
     if (run) _overlay = null;
     _lesson = _level['lesson'] as String;
     _lessonPending = !run;
-    _lessonTime = run ? 3.6 : 0;
+    _lessonTime = run ? _lessonShown + _titleCardTime : 0;
     _hint = '';
     _persist();
     _setHud();
@@ -936,6 +1128,15 @@ class VenomcoilGame extends FlameGame with KeyboardEvents {
     _setHud();
   }
 
+  void _clearInput() {
+    _left = false;
+    _right = false;
+    _moveAxis = 0;
+    _coilHeld = false;
+    _coil = 0;
+    _jumpBuffer = 0;
+  }
+
   /// Start at the saved spot; the skippable how-to-play cards come first.
   Future<void> playFromMenu() async {
     await selectArea(save.area, checkpoint: save.checkpoint);
@@ -948,6 +1149,7 @@ class VenomcoilGame extends FlameGame with KeyboardEvents {
 
   void showTutorial({bool beforeRun = false}) {
     _tutorialToMenu = !beforeRun && _overlay == 'menu';
+    _clearInput();
     _paused = true;
     _overlay = 'tutorial';
     _setHud();
@@ -964,6 +1166,7 @@ class VenomcoilGame extends FlameGame with KeyboardEvents {
 
   void _openSub(String name) {
     if (_overlay != 'areas' && _overlay != 'skins') _backTo = _overlay;
+    _clearInput();
     _paused = true;
     _overlay = name;
     _setHud();
@@ -1015,7 +1218,7 @@ class VenomcoilGame extends FlameGame with KeyboardEvents {
     _backTo = null;
     if (_lessonPending) {
       _lessonPending = false;
-      _lessonTime = 3.6;
+      _lessonTime = _lessonShown + _titleCardTime;
     }
     _setHud();
   }
@@ -1025,27 +1228,24 @@ class VenomcoilGame extends FlameGame with KeyboardEvents {
       return;
     }
     _paused = !_paused;
-    if (_paused) {
-      _left = false;
-      _right = false;
-      _moveAxis = 0;
-      _coilHeld = false;
-      _coil = 0;
-      _jumpBuffer = 0;
-    }
+    if (_paused) _clearInput();
     _overlay = _paused ? 'pause' : null;
     _setHud();
   }
 
   void quitToMenu() {
     _persist();
+    _dead = false;
+    _completed = false;
     showMenu();
+    unawaited(_enterMenuStage(save.area));
   }
 
   Future<void> resetProgress() async {
     await save.resetProgress();
-    await selectArea(0, run: false);
+    _refreshSaveViews();
     showMenu();
+    await _enterMenuStage(0);
   }
 
   void cycleVolume() {
@@ -1069,8 +1269,13 @@ class VenomcoilGame extends FlameGame with KeyboardEvents {
   void saveNow() => _persist();
 
   void _persist({int? area, int? checkpoint}) {
-    save.area = area ?? _area;
-    save.checkpoint = checkpoint ?? _checkpoint;
+    // Outside a live run (title screen, cleared area, boss wipe) the spot to
+    // come back to is already saved; only an explicit value may replace it.
+    final liveRun = _inStage && !_completed && !_bossWipe;
+    if (area != null || liveRun) save.area = area ?? _area;
+    if (checkpoint != null || liveRun) {
+      save.checkpoint = checkpoint ?? _checkpoint;
+    }
     save.skin = _skinIndex;
     save.volumeLevel = _audio.level.value;
     unawaited(save.save());
@@ -1094,6 +1299,9 @@ class VenomcoilGame extends FlameGame with KeyboardEvents {
     _coyoteTime = _grounded ? 0.16 : 0;
     _cameraX = stageStart;
     _cameraY = _playerY - 40;
+    // Pull the chasing lava back too, or it swallows the respawn point forever.
+    _lavaX = math.max(-180, stageStart - 700);
+    _lavaY = 780;
     _coil = 0;
     _jumpBuffer = 0;
     _coilHeld = false;
@@ -1103,7 +1311,9 @@ class VenomcoilGame extends FlameGame with KeyboardEvents {
     _moveAxis = 0;
     _hearts = 3;
     _invulnerable = 0;
+    _shake = 0;
     _bossShots.clear();
+    _particles.clear();
     _dead = false;
     _completed = false;
     _started = false;
@@ -1215,9 +1425,11 @@ class VenomcoilGame extends FlameGame with KeyboardEvents {
   @override
   void update(double dt) {
     super.update(dt);
-    if (_levels.isEmpty) return;
+    if (_levels.isEmpty || _loading) return;
     dt = dt.clamp(0, 1 / 30);
     _clock += dt;
+    _particles.update(dt);
+    _shake = math.max(0, _shake - dt * 2.6);
     for (final effect in _effects) {
       effect.age += dt;
     }
@@ -1247,7 +1459,9 @@ class VenomcoilGame extends FlameGame with KeyboardEvents {
       }
       return;
     }
+    // Enemies far outside the view are switched off until the player nears.
     for (final enemy in _enemies) {
+      if (!enemy.active || (enemy.x - _playerX).abs() > 1500) continue;
       enemy.time += dt;
       enemy.hurtTime = math.max(0, enemy.hurtTime - dt);
       enemy.fireTime = math.max(0, enemy.fireTime - dt);
@@ -1336,6 +1550,7 @@ class VenomcoilGame extends FlameGame with KeyboardEvents {
       _playerAction = 'coil';
       _actionTime = 0.22;
       _audio.sfx('jump');
+      _dust(_playerX, _playerY, 8);
     } else if (!_coilHeld && !_grounded) {
       _coil = 0;
     }
@@ -1411,7 +1626,10 @@ class VenomcoilGame extends FlameGame with KeyboardEvents {
         }
       }
       if (landing != null) {
-        if (!wasGrounded && _velocityY > 320) _audio.sfx('land');
+        if (!wasGrounded && _velocityY > 320) {
+          _audio.sfx('land');
+          _dust(_playerX, landingY, 10);
+        }
         _playerY = landingY;
         _velocityY = 0;
         _grounded = true;
@@ -1437,6 +1655,15 @@ class VenomcoilGame extends FlameGame with KeyboardEvents {
       // dying and respawning here (see retry).
       _showHint('CHECKPOINT $_checkpoint/12');
       _audio.sfx('checkpoint');
+      _particles.burst(
+        nextCheckpoint,
+        _platformYBelow(nextCheckpoint) - 60,
+        _goldRgb,
+        count: 26,
+        speed: 300,
+        life: 0.9,
+        size: 16,
+      );
       _fx(
         'fx_core-transparent.webp',
         2,
@@ -1454,21 +1681,25 @@ class VenomcoilGame extends FlameGame with KeyboardEvents {
       if (_playerX < _lavaX + 80 || _playerY > _lavaY) _hurt(fatal: true);
     }
     if (_playerY > 860) _hurt(fatal: true);
-    final exitGates = _hazards
-        .where(
-          (hazard) => hazard.type == 'puzzleGate' && hazard.x >= _length - 400,
-        )
-        .toList();
-    final exitGate = exitGates.isEmpty ? null : exitGates.first;
+    final exitGate = _exitGate;
     if (_playerX >= _length - 70 &&
         !_dead &&
         (exitGate == null || !exitGate.active) &&
-        !_enemies.any((enemy) => enemy.boss && enemy.active)) {
+        !_bosses.any((enemy) => enemy.active)) {
       _completed = true;
       _paused = true;
       _overlay = 'complete';
       _playerAction = 'victory';
       _audio.sfx('complete');
+      _particles.burst(
+        _playerX,
+        _playerY - 70,
+        _goldRgb,
+        count: 46,
+        speed: 420,
+        life: 1.1,
+        size: 18,
+      );
       _fx(
         'fx_core-transparent.webp',
         2,
@@ -1483,11 +1714,16 @@ class VenomcoilGame extends FlameGame with KeyboardEvents {
         final best = save.bestTimes[_area];
         if (best == null || _elapsed < best) save.bestTimes[_area] = _elapsed;
       }
+      _refreshSaveViews();
       _persist(area: math.min(_area + 1, _levels.length - 1), checkpoint: 0);
     }
     _cameraX +=
         (_playerX + _velocityX * 0.35 - _cameraX) * math.min(1, dt * 4.5);
     _cameraY += (_playerY - 40 - _cameraY) * math.min(1, dt * 3.5);
+    momentumMeter.value = (_velocityX.abs() / 560 * 40).round().clamp(0, 40) / 40;
+    coilMeter.value = (_coil * 40).round() / 40;
+    attackCooldownMeter.value = (_attackCooldown / 0.42 * 30).ceil() / 30;
+    venomCooldownMeter.value = (_venomCooldown / 0.36 * 30).ceil() / 30;
     // The HUD only displays coarse time and meter values. Rebuilding its
     // entire Flutter widget tree every few frames competes with game frames.
     if (_hudTicker >= 0.16) {
@@ -1537,9 +1773,7 @@ class VenomcoilGame extends FlameGame with KeyboardEvents {
       _sinkTime = math.max(0, _sinkTime - dt * 2);
     }
     for (final hazard in _hazards) {
-      if (!hazard.enabled || !['wind', 'updraft'].contains(hazard.type)) {
-        continue;
-      }
+      if (!hazard.enabled || !_airCurrents.contains(hazard.type)) continue;
       final width = hazard.type == 'wind' ? 250.0 : 190.0;
       final height = hazard.type == 'wind' ? 520.0 : 440.0;
       if (_playerX > hazard.x &&
@@ -1563,16 +1797,7 @@ class VenomcoilGame extends FlameGame with KeyboardEvents {
         _activateHazard(hazard);
         continue;
       }
-      if (![
-        'wall',
-        'venomWall',
-        'gate',
-        'puzzleGate',
-        'iceWall',
-        'pillar',
-      ].contains(hazard.type)) {
-        continue;
-      }
+      if (!_solidTypes.contains(hazard.type)) continue;
       // Locked gates / portals are full-height force fields: no jumping over.
       final fullHeight = hazard.type == 'gate' || hazard.type == 'puzzleGate';
       if ((hazard.x - _playerX).abs() > 74 ||
@@ -1600,6 +1825,9 @@ class VenomcoilGame extends FlameGame with KeyboardEvents {
     }
   }
 
+  /// Fires a little below the jaw, nearer the height of ground enemies.
+  static const _venomDrop = 60.0;
+
   void _spitVenom() {
     if ((_level['id'] as int) < 2) {
       _showHint('VENOM UNLOCKS IN AREA 2');
@@ -1616,12 +1844,12 @@ class VenomcoilGame extends FlameGame with KeyboardEvents {
     final sheet =
         _store.sheet(_skinFile(_skinIndex, 'motion_a')) ??
         _store.sheet('vexa_motion_a-transparent.webp');
-    var mouthX = 34.0, mouthY = -38.0;
+    var mouthX = 34.0, mouthY = -38.0 + _venomDrop;
     if (sheet != null) {
       final scale = 192 / sheet.cellWidth;
       final ref = sheet.rowMax(0);
       mouthX = ref.width * scale * 0.4 + 14;
-      mouthY = -ref.height * scale * 0.76 + 3;
+      mouthY = -ref.height * scale * 0.76 + 3 + _venomDrop;
     }
     _shots.add(
       _VenomShot(
@@ -1639,6 +1867,18 @@ class VenomcoilGame extends FlameGame with KeyboardEvents {
     _actionTime = 0.3;
     final direction = _playerDirection;
     _audio.sfx('attack');
+    _particles.burst(
+      _playerX + direction * 70,
+      _playerY - 70,
+      _skinRgb,
+      count: 10,
+      speed: 320,
+      life: 0.32,
+      size: 13,
+      gravity: 0,
+      angle: direction > 0 ? 0 : math.pi,
+      spread: 0.9,
+    );
     _fx(
       _fxFile,
       2,
@@ -1713,6 +1953,7 @@ class VenomcoilGame extends FlameGame with KeyboardEvents {
     _openActivatedTag(hazard.activates, fx: !silent);
     if (!silent) {
       _audio.sfx('switch');
+      _particles.burst(hazard.x, hazard.y - 50, _goldRgb, count: 14, speed: 260);
       _fx(
         'fx_core-transparent.webp',
         2,
@@ -1750,6 +1991,7 @@ class VenomcoilGame extends FlameGame with KeyboardEvents {
     for (final platform in _platforms) {
       if (platform.tag == tag) platform.enabled = true;
     }
+    _cacheCheckpointHeights();
     for (final hazard in _hazards) {
       if (hazard.tag != tag) continue;
       if (hazard.type == 'updraft') {
@@ -1763,6 +2005,16 @@ class VenomcoilGame extends FlameGame with KeyboardEvents {
   void _defeatEnemy(_Enemy enemy) {
     enemy.active = false;
     _audio.sfx('defeat');
+    _particles.burst(
+      enemy.x,
+      enemy.y - 40,
+      enemy.boss ? _goldRgb : _skinRgb,
+      count: enemy.boss ? 60 : 18,
+      speed: enemy.boss ? 520 : 300,
+      life: enemy.boss ? 1.2 : 0.6,
+      size: enemy.boss ? 24 : 16,
+    );
+    _shake = math.max(_shake, enemy.boss ? 1 : 0.25);
     _fx(
       'fx_impacts-transparent.webp',
       0,
@@ -1801,17 +2053,7 @@ class VenomcoilGame extends FlameGame with KeyboardEvents {
       shot.age += dt;
       shot.x += shot.velocityX * dt;
       for (final hazard in _hazards) {
-        if (!hazard.active ||
-            ![
-              'venomWall',
-              'iceWall',
-              'switch',
-              'venomSwitch',
-              'momentumSwitch',
-              'cocoon',
-            ].contains(hazard.type)) {
-          continue;
-        }
+        if (!hazard.active || !_venomTargets.contains(hazard.type)) continue;
         if ((hazard.x - shot.x).abs() < 68 && (hazard.y - shot.y).abs() < 150) {
           _activateHazard(hazard);
           _shotHit(shot);
@@ -1924,6 +2166,7 @@ class VenomcoilGame extends FlameGame with KeyboardEvents {
 
   void _shotHit(_VenomShot shot) {
     shot.age = 3;
+    _particles.burst(shot.x, shot.y, _skinRgb, count: 10, speed: 240, life: 0.4);
     _venomBursts.add(_VenomBurst(shot.x, shot.y + 36));
   }
 
@@ -1978,6 +2221,15 @@ class VenomcoilGame extends FlameGame with KeyboardEvents {
     _invulnerable = 1.2;
     _hurtFlash = 0.45;
     _hurtCount++;
+    _shake = math.max(_shake, fatal ? 1 : 0.7);
+    _particles.burst(
+      _playerX,
+      _playerY - 60,
+      0xff3b30,
+      count: 16,
+      speed: 300,
+      life: 0.5,
+    );
     if (_hearts > 0) _showHint('-1 NYAWA');
     _audio.sfx(_hearts <= 0 ? 'death' : 'hurt');
     _fx(
@@ -2022,6 +2274,35 @@ class VenomcoilGame extends FlameGame with KeyboardEvents {
     for (var i = 1; i <= 12; i++) {
       _checkpointXs.add(_platformCenterX(_length * i / 13));
     }
+    _cacheCheckpointHeights();
+  }
+
+  /// Flag heights, refreshed only when a bridge opens; finding them meant
+  /// scanning every platform for every visible flag on every frame.
+  void _cacheCheckpointHeights() {
+    _checkpointYs
+      ..clear()
+      ..addAll(_checkpointXs.map(_platformYBelow));
+  }
+
+  int get _skinRgb =>
+      skinColors[_skinIndex.clamp(0, 9)].toARGB32() & 0xffffff;
+
+  static const _goldRgb = 0xffd66a;
+
+  void _dust(double x, double y, int count) {
+    _particles.burst(
+      x,
+      y - 4,
+      // Particles add light: a dim tone stays dust instead of a white flare.
+      0x4a3f2e,
+      count: count,
+      speed: 170,
+      life: 0.4,
+      size: 13,
+      gravity: -30,
+      spread: 1.35,
+    );
   }
 
   // Snap a target x to the centre of the platform it sits on so the
@@ -2051,11 +2332,24 @@ class VenomcoilGame extends FlameGame with KeyboardEvents {
 
   void _setHud() {
     final name = _level['shortName'] as String? ?? 'Canopy Roots';
-    final label = _hintTime > 0 ? _hint : (_lessonTime > 0 ? _lesson : '');
+    // The lesson waits for the area title card to finish.
+    final label = _hintTime > 0
+        ? _hint
+        : (_lessonTime > 0 && _lessonTime <= _lessonShown ? _lesson : '');
+    if (_overlay == null && _introPending && !_loading) {
+      _introPending = false;
+      _intro++;
+    }
+    _Enemy? boss;
+    for (final enemy in _bosses) {
+      if (enemy.active && (enemy.x - _playerX).abs() <= 820) {
+        boss = enemy;
+        break;
+      }
+    }
+    final sentinel = boss?.type == 'sentinel';
     hud.value = GameHudState(
       hearts: _hearts,
-      momentum: (_velocityX.abs() / 560).clamp(0.0, 1.0),
-      coilCharge: _coil,
       area: _area + 1,
       areaName: name,
       lesson: label,
@@ -2065,15 +2359,70 @@ class VenomcoilGame extends FlameGame with KeyboardEvents {
       hint: label,
       skinIndex: _skinIndex,
       checkpoint: _checkpoint,
-      completed: Set.of(save.completed),
-      bestTimes: Map.of(save.bestTimes),
+      completed: _completedView,
+      bestTimes: _bestView,
       hasProgress: save.hasProgress,
       savedArea: save.area,
       savedCheckpoint: save.checkpoint,
       bossWipe: _bossWipe,
       hurtCount: _hurtCount,
+      loading: _loading,
+      overMenu: _backTo == 'menu' || _tutorialToMenu,
+      intro: _intro,
+      bossHp: boss == null ? 0 : (sentinel ? 3 - boss.parries : boss.hp),
+      bossMaxHp: boss == null ? 0 : (sentinel ? 3 : boss.maxHp),
+      bossName: boss == null ? '' : _bossNames[boss.type] ?? '',
     );
-    unawaited(_audio.music(_musicTrack));
+    final track = _musicTrack;
+    if (track != _lastTrack) {
+      _lastTrack = track;
+      unawaited(_audio.music(track));
+    }
+    _syncEngine();
+  }
+
+  /// Runs the game loop only while the world is on screen and moving. Behind
+  /// the title screen and popups the loop is off: no update, no render, and
+  /// with nothing animating the app schedules no frames at all.
+  void _syncEngine() {
+    final settling =
+        (_dead || _completed) &&
+        (_effects.isNotEmpty || !_particles.isEmpty || _venomBursts.isNotEmpty);
+    final live = !_loading && (_overlay == null || settling);
+    if (live) {
+      if (paused) resumeEngine();
+      return;
+    }
+    if (!paused) pauseEngine();
+    if (_needsFrame && _inStage && !_loading) {
+      // A new area was set up behind a popup: draw it once.
+      _needsFrame = false;
+      stepEngine(stepTime: 0);
+    }
+  }
+
+  /// Screen-sized shaders only change with the window, never per frame.
+  void _updateScreenShaders(double width, double height) {
+    final screen = ui.Size(width, height);
+    if (screen == _shadedSize) return;
+    _shadedSize = screen;
+    _gradePaint.shader = ui.Gradient.linear(
+      ui.Offset.zero,
+      ui.Offset(0, height),
+      [
+        _groundColor.withValues(alpha: 0.2),
+        const ui.Color(0x00000000),
+        const ui.Color(0x55020407),
+      ],
+      const [0, 0.5, 1],
+    );
+    final center = ui.Offset(width / 2, height * 0.46);
+    _vignettePaint.shader = ui.Gradient.radial(
+      center,
+      screen.longestSide * 0.68,
+      const [ui.Color(0x00000000), ui.Color(0x12000000), ui.Color(0x99000000)],
+      const [0.45, 0.72, 1],
+    );
   }
 
   @override
@@ -2082,38 +2431,35 @@ class VenomcoilGame extends FlameGame with KeyboardEvents {
     final screenWidth = size.x;
     final screenHeight = size.y;
     if (screenWidth <= 0 || screenHeight <= 0) return;
-    final stage = _level.isEmpty
-        ? _levels.first as Map<String, dynamic>
-        : _level;
-    final palette = (stage['palette'] as List<dynamic>).cast<String>();
-    final color = _parseColor(palette[0]);
-    final bg = _store[stage['bg'] as String];
-    canvas.drawRect(
-      ui.Rect.fromLTWH(0, 0, screenWidth, screenHeight),
-      ui.Paint()..color = color,
-    );
+    // The title screen fully covers the world, so nothing is drawn behind it.
+    if (!_inStage) {
+      canvas.drawColor(const ui.Color(0xff050b0a), ui.BlendMode.src);
+      return;
+    }
+    final screen = ui.Rect.fromLTWH(0, 0, screenWidth, screenHeight);
+    _updateScreenShaders(screenWidth, screenHeight);
+    final bg = _store[_level['bg'] as String];
+    canvas.drawRect(screen, ui.Paint()..color = _groundColor);
     if (bg != null) {
       final scale = math.max(screenHeight / bg.height, screenWidth / bg.width);
       final drawW = bg.width * scale;
       final drawH = bg.height * scale;
       final parallax = (_cameraX * 0.08 * (screenWidth / 720)) % drawW;
+      final source = ui.Rect.fromLTWH(
+        0,
+        0,
+        bg.width.toDouble(),
+        bg.height.toDouble(),
+      );
       for (var x = -parallax; x < screenWidth; x += drawW) {
         canvas.drawImageRect(
           bg,
-          ui.Rect.fromLTWH(0, 0, bg.width.toDouble(), bg.height.toDouble()),
+          source,
           ui.Rect.fromLTWH(x, 0, drawW, drawH),
-          ui.Paint()..filterQuality = ui.FilterQuality.low,
+          _backdropPaint,
         );
       }
-      canvas.drawRect(
-        ui.Rect.fromLTWH(0, 0, screenWidth, screenHeight),
-        ui.Paint()
-          ..shader = ui.Gradient.linear(
-            ui.Offset.zero,
-            ui.Offset(0, screenHeight),
-            [const ui.Color(0x11040c12), const ui.Color(0x2204080c)],
-          ),
-      );
+      canvas.drawRect(screen, _gradePaint);
     }
 
     // 720 world units span the short side, so portrait and landscape both work.
@@ -2125,39 +2471,58 @@ class VenomcoilGame extends FlameGame with KeyboardEvents {
         .toDouble();
     final cameraTop = (_cameraY - math.min(visibleHeight * 0.5, 500.0))
         .toDouble();
+    final shakeAmount = _shake * _shake * 11;
     canvas.save();
+    if (shakeAmount > 0.05) {
+      canvas.translate(
+        math.sin(_clock * 67) * shakeAmount,
+        math.cos(_clock * 53) * shakeAmount,
+      );
+    }
     canvas.scale(worldScale);
     canvas.translate(-cameraLeft, -cameraTop);
-    _drawParticles(
-      canvas,
-      cameraLeft,
-      cameraTop,
-      visibleWidth,
-      visibleHeight,
-      palette,
-    );
+    _queueLightShafts(cameraLeft, cameraTop, visibleWidth, visibleHeight);
+    _glows.flush(canvas, _glowPaint);
     _drawScenery(canvas);
     _drawPlatforms(canvas);
-    _drawCheckpoints(canvas, palette);
-    _drawHazards(canvas, palette);
-    _drawEnemies(canvas, stage);
+    _drawCheckpoints(canvas);
+    _drawHazards(canvas);
+    _queueGroundShadows();
+    _shadows.flush(canvas, _shadowPaint);
+    _drawEnemies(canvas);
     _drawShots(canvas);
-    _drawVenomBursts(canvas);
-    _drawBossShots(canvas);
-    if (stage['chase'] == true) {
-      _drawLava(canvas, cameraTop, visibleHeight, palette);
+    _queueVenomBursts();
+    _queueBossShots();
+    if (_level['chase'] == true) {
+      _drawLava(canvas, cameraTop, visibleHeight);
     }
     _drawPlayer(canvas);
     _drawEffects(canvas);
+    queueAmbientMotes(
+      _glows,
+      count: 22,
+      left: cameraLeft,
+      top: cameraTop,
+      width: visibleWidth,
+      height: visibleHeight,
+      time: _clock,
+      rgb: _accentColor.toARGB32(),
+      rise: _area == 9 ? 46 : 14,
+      radius: 9,
+      alpha: 0.5,
+      seed: _area,
+    );
+    _particles.queue(_glows);
+    _glows.flush(canvas, _glowPaint);
     canvas.restore();
+    canvas.drawRect(screen, _vignettePaint);
     if (_hurtFlash > 0) {
-      final rect = ui.Rect.fromLTWH(0, 0, screenWidth, screenHeight);
       canvas.drawRect(
-        rect,
+        screen,
         ui.Paint()
           ..shader = ui.Gradient.radial(
-            rect.center,
-            rect.longestSide * 0.6,
+            screen.center,
+            screen.longestSide * 0.6,
             [
               const ui.Color(0x00ff1e1e),
               const ui.Color(0xffd01818).withValues(alpha: _hurtFlash),
@@ -2168,33 +2533,50 @@ class VenomcoilGame extends FlameGame with KeyboardEvents {
     }
   }
 
-  void _drawParticles(
-    ui.Canvas canvas,
-    double left,
-    double top,
-    double width,
-    double height,
-    List<String> palette,
-  ) {
-    final accent = _parseColor(palette[2]);
-    for (var i = 0; i < 16; i++) {
-      final px = left + ((i * 263 + _area * 71) % width);
-      final py = top + ((i * 137 + _elapsed * (_area == 9 ? 34 : 10)) % height);
-      canvas.drawCircle(
-        ui.Offset(px, py),
-        2 + i % 3.0,
-        ui.Paint()..color = accent.withValues(alpha: 0.18),
+  final ui.Paint _backdropPaint = ui.Paint()
+    ..filterQuality = ui.FilterQuality.low;
+
+  /// Soft pools of light in the area's colour, drifting slower than the world.
+  void _queueLightShafts(double left, double top, double width, double height) {
+    final rgb = _primaryColor.toARGB32();
+    for (var i = 0; i < 3; i++) {
+      final x = left + width * (0.2 + i * 0.3) - (left * 0.04) % 240;
+      final pulse = 0.5 + 0.5 * math.sin(_clock * 0.5 + i * 2.1);
+      _glows.add(
+        x,
+        top + height * 0.14,
+        height * (0.42 + i * 0.05),
+        glowColor(rgb, 0.05 + pulse * 0.05),
       );
     }
   }
 
-  void _cachePlatformPictures(List<String> palette) {
-    for (final platform in _platforms) {
-      final endY = platform.endY ?? platform.y;
-      final top = math.min(platform.y, endY) - 4;
-      final bottom = math.max(platform.y, endY) + 120;
-      final recorder = ui.PictureRecorder();
-      final platformCanvas = ui.Canvas(
+  /// Contact shadows ground the hero and walkers on the ledges.
+  void _queueGroundShadows() {
+    final footY = _grounded ? _playerY : _platformYBelow(_playerX);
+    final height = (footY - _playerY).abs();
+    if (height < 420) {
+      _shadows.add(
+        _playerX,
+        footY + 4,
+        62 * (1 - height / 700),
+        glowColor(0, 0.5 * (1 - height / 420)),
+      );
+    }
+    for (final enemy in _enemies) {
+      if (!enemy.active || !_groundsAt.contains(enemy.type)) continue;
+      if ((enemy.x - _cameraX).abs() > 750) continue;
+      _shadows.add(enemy.x, enemy.baseY + 4, 58, glowColor(0, 0.42));
+    }
+  }
+
+  ui.Picture _recordPlatform(_Platform platform) {
+    final endY = platform.endY ?? platform.y;
+    final top = math.min(platform.y, endY) - 4;
+    final bottom = math.max(platform.y, endY) + 120;
+    final recorder = ui.PictureRecorder();
+    _drawPlatform(
+      ui.Canvas(
         recorder,
         ui.Rect.fromLTWH(
           platform.x - 90,
@@ -2202,10 +2584,10 @@ class VenomcoilGame extends FlameGame with KeyboardEvents {
           platform.width + 180,
           bottom - top + 140,
         ),
-      );
-      _drawPlatform(platformCanvas, platform, palette);
-      _platformPictures[platform] = recorder.endRecording();
-    }
+      ),
+      platform,
+    );
+    return recorder.endRecording();
   }
 
   void _clearPlatformPictures() {
@@ -2215,31 +2597,33 @@ class VenomcoilGame extends FlameGame with KeyboardEvents {
     _platformPictures.clear();
   }
 
+  /// Tiled ledges are one image draw. Hand-drawn ones (the area without tile
+  /// art) are recorded when they come into view and dropped once far behind.
   void _drawPlatforms(ui.Canvas canvas) {
+    final tile = _tileFile == null ? null : _store.sheet(_tileFile!);
     for (final platform in _platforms) {
-      if (!platform.enabled) continue;
-      if (platform.x + platform.width < _cameraX - 180 ||
-          platform.x > _cameraX + 1000) {
+      final visible =
+          platform.enabled &&
+          platform.x + platform.width >= _cameraX - 800 &&
+          platform.x <= _cameraX + 1400;
+      if (!visible) {
+        if (tile == null) _platformPictures.remove(platform)?.dispose();
         continue;
       }
-      final picture = _platformPictures[platform];
-      if (picture != null) canvas.drawPicture(picture);
+      if (tile != null) {
+        _drawTiledPlatform(canvas, platform, tile);
+      } else {
+        canvas.drawPicture(
+          _platformPictures[platform] ??= _recordPlatform(platform),
+        );
+      }
     }
   }
 
-  void _drawPlatform(
-    ui.Canvas canvas,
-    _Platform platform,
-    List<String> palette,
-  ) {
-    final tile = _tileFile == null ? null : _store.sheet(_tileFile!);
-    if (tile != null) {
-      _drawTiledPlatform(canvas, platform, palette, tile);
-      return;
-    }
-    final groundColor = _parseColor(palette[0]);
-    final glow = _parseColor(palette[1]);
-    final accent = _parseColor(palette[2]);
+  void _drawPlatform(ui.Canvas canvas, _Platform platform) {
+    final groundColor = _groundColor;
+    final glow = _primaryColor;
+    final accent = _accentColor;
     final soil = ui.Color.lerp(const ui.Color(0xffa77b49), accent, 0.12)!;
     final deepSoil = ui.Color.lerp(
       const ui.Color(0xff30251c),
@@ -2351,7 +2735,6 @@ class VenomcoilGame extends FlameGame with KeyboardEvents {
   void _drawTiledPlatform(
     ui.Canvas canvas,
     _Platform platform,
-    List<String> palette,
     SheetInfo tile,
   ) {
     final endY = platform.endY ?? platform.y;
@@ -2371,7 +2754,7 @@ class VenomcoilGame extends FlameGame with KeyboardEvents {
     );
     const drawHeight = 150.0;
     final top = -drawHeight * 0.22;
-    final paint = ui.Paint()..filterQuality = ui.FilterQuality.medium;
+    final paint = _spritePaint..color = const ui.Color(0xffffffff);
     canvas.save();
     canvas.translate(platform.x, platform.y);
     canvas.rotate(angle);
@@ -2430,7 +2813,7 @@ class VenomcoilGame extends FlameGame with KeyboardEvents {
 
   void _drawScenery(ui.Canvas canvas) {
     for (final item in _scenery) {
-      if ((item.x - _cameraX).abs() > 700) continue;
+      if ((item.x - _cameraX).abs() > 1100) continue;
       final sheet = _store.sheet(item.file);
       if (sheet == null) continue;
       final col = item.cell % sheet.cols;
@@ -2745,33 +3128,20 @@ class VenomcoilGame extends FlameGame with KeyboardEvents {
 
   void _drawHalo(ui.Canvas canvas, double x, double y, ui.Color color) {
     final pulse = 0.5 + 0.5 * math.sin(_clock * 4);
-    final radius = 46 + 8 * pulse;
-    canvas.drawCircle(
-      ui.Offset(x, y),
-      radius,
-      ui.Paint()
-        ..shader = ui.Gradient.radial(ui.Offset(x, y), radius, [
-          color.withValues(alpha: 0.34),
-          color.withValues(alpha: 0),
-        ]),
-    );
+    _glows.add(x, y, 58 + 12 * pulse, glowColor(color.toARGB32(), 0.5 + 0.2 * pulse));
   }
 
-  void _drawCheckpoints(ui.Canvas canvas, List<String> palette) {
-    final accent = _parseColor(palette[2]);
-    for (var i = 1; i <= 12; i++) {
-      final x = _checkpointXs.isEmpty ? _length * i / 13 : _checkpointXs[i - 1];
-      if ((x - _cameraX).abs() > 580) continue;
-      final y = _platformYBelow(x);
+  void _drawCheckpoints(ui.Canvas canvas) {
+    final accent = _accentColor;
+    for (var i = 1; i <= _checkpointXs.length; i++) {
+      final x = _checkpointXs[i - 1];
+      if ((x - _cameraX).abs() > 1000) continue;
+      final y = _checkpointYs[i - 1];
       final active = i <= _checkpoint;
       final hudSheet = _store.sheet('hud_atlas-transparent.webp');
       if (hudSheet != null) {
         if (active) {
-          canvas.drawCircle(
-            ui.Offset(x + 20, y - 62),
-            48,
-            ui.Paint()..color = accent.withValues(alpha: 0.18),
-          );
+          _glows.add(x + 16, y - 62, 86, glowColor(accent.toARGB32(), 0.5));
         }
         _drawCell(
           canvas,
@@ -2817,43 +3187,36 @@ class VenomcoilGame extends FlameGame with KeyboardEvents {
   void _drawBarrier(ui.Canvas canvas, _Hazard hazard, ui.Color color) {
     const top = -1400.0;
     final bottom = hazard.y + 10;
-    final rect = ui.Rect.fromLTRB(hazard.x - 30, top, hazard.x + 30, bottom);
+    // Stacked bands fake the beam's soft edge without a gradient per frame.
+    final band = _barrierPaint;
+    for (final (half, alpha) in const [(30.0, 0.05), (18.0, 0.07), (7.0, 0.12)]) {
+      band.color = color.withValues(alpha: alpha);
+      canvas.drawRect(
+        ui.Rect.fromLTRB(hazard.x - half, top, hazard.x + half, bottom),
+        band,
+      );
+    }
+    band.color = color.withValues(alpha: 0.55);
     canvas.drawRect(
-      rect,
-      ui.Paint()
-        ..shader = ui.Gradient.linear(
-          ui.Offset(rect.left, 0),
-          ui.Offset(rect.right, 0),
-          [
-            color.withValues(alpha: 0),
-            color.withValues(alpha: 0.22),
-            color.withValues(alpha: 0),
-          ],
-          const [0, 0.5, 1],
-        ),
+      ui.Rect.fromLTRB(hazard.x - 1, top, hazard.x + 1, bottom),
+      band,
     );
-    final edge = ui.Paint()
-      ..color = color.withValues(alpha: 0.45)
-      ..strokeWidth = 2;
-    canvas.drawLine(
-      ui.Offset(hazard.x, top),
-      ui.Offset(hazard.x, bottom),
-      edge,
-    );
-    // Rising hex sparks so the field shimmers.
-    final spark = ui.Paint()..color = color.withValues(alpha: 0.6);
+    // Rising sparks so the field shimmers.
+    final rgb = color.toARGB32();
     for (var i = 0; i < 10; i++) {
       final y = bottom - ((_clock * 90 + i * 137) % (bottom - top));
       final x = hazard.x + math.sin(_clock * 3 + i) * 18;
-      canvas.drawCircle(ui.Offset(x, y), 2.5, spark);
+      _glows.add(x, y, 9, glowColor(rgb, 0.8));
     }
   }
 
-  void _drawHazards(ui.Canvas canvas, List<String> palette) {
-    final accent = _parseColor(palette[2]);
-    final primary = _parseColor(palette[1]);
+  final ui.Paint _barrierPaint = ui.Paint();
+
+  void _drawHazards(ui.Canvas canvas) {
+    final accent = _accentColor;
+    final primary = _primaryColor;
     for (final hazard in _hazards) {
-      if (!hazard.active || (hazard.x - _cameraX).abs() > 800) continue;
+      if (!hazard.active || (hazard.x - _cameraX).abs() > 1100) continue;
       if (hazard.type == 'gate' || hazard.type == 'puzzleGate') {
         _drawBarrier(canvas, hazard, accent);
       }
@@ -2955,7 +3318,7 @@ class VenomcoilGame extends FlameGame with KeyboardEvents {
     }
   }
 
-  void _drawEnemies(ui.Canvas canvas, Map<String, dynamic> stage) {
+  void _drawEnemies(ui.Canvas canvas) {
     const sizes = <String, double>{
       'frog': 105,
       'spider': 120,
@@ -2968,7 +3331,7 @@ class VenomcoilGame extends FlameGame with KeyboardEvents {
       'world_serpent': 310,
     };
     for (final enemy in _enemies) {
-      if (!enemy.active || (enemy.x - _cameraX).abs() > 750) continue;
+      if (!enemy.active || (enemy.x - _cameraX).abs() > 1100) continue;
       if (enemy.type == 'prism_leviathan' || enemy.type == 'world_serpent') {
         _drawBigBoss(canvas, enemy, sizes[enemy.type]!);
         continue;
@@ -3119,86 +3482,54 @@ class VenomcoilGame extends FlameGame with KeyboardEvents {
     }
   }
 
-  /// Venom splash where a glob lands: skin-coloured rings, no sheet art.
-  void _drawVenomBursts(ui.Canvas canvas) {
-    final glow = VenomcoilGame.skinColors[_skinIndex.clamp(0, 9)];
+  /// Venom splash where a glob lands: skin-coloured bloom and droplets.
+  void _queueVenomBursts() {
+    final rgb = _skinRgb;
     for (final burst in _venomBursts) {
       final t = (burst.age / _VenomBurst.duration).clamp(0.0, 1.0);
       final fade = 1 - t;
-      canvas.drawCircle(
-        ui.Offset(burst.x, burst.y),
-        18 + t * 56,
-        ui.Paint()
-          ..color = glow.withValues(alpha: 0.35 * fade)
-          ..maskFilter = const ui.MaskFilter.blur(ui.BlurStyle.normal, 8),
-      );
-      canvas.drawCircle(
-        ui.Offset(burst.x, burst.y),
-        10 + t * 34,
-        ui.Paint()
-          ..style = ui.PaintingStyle.stroke
-          ..strokeWidth = 4 * fade + 1
-          ..color = glow.withValues(alpha: 0.8 * fade),
-      );
+      _glows.add(burst.x, burst.y, 34 + t * 70, glowColor(rgb, 0.8 * fade));
       for (var i = 0; i < 6; i++) {
         final a = i * math.pi / 3 + 0.3;
         final d = 14 + t * 46;
-        canvas.drawCircle(
-          ui.Offset(burst.x + math.cos(a) * d, burst.y + math.sin(a) * d),
-          3.5 * fade + 1,
-          ui.Paint()..color = glow.withValues(alpha: 0.9 * fade),
+        _glows.add(
+          burst.x + math.cos(a) * d,
+          burst.y + math.sin(a) * d,
+          7 * fade + 3,
+          glowColor(rgb, fade),
         );
       }
     }
   }
 
-  void _drawBossShots(ui.Canvas canvas) {
+  void _queueBossShots() {
     // Wind-up glow so the player can read the next shot coming.
-    for (final enemy in _enemies) {
-      if (!enemy.active || !enemy.boss || enemy.attackTimer > 0.55) continue;
+    for (final enemy in _bosses) {
+      if (!enemy.active || enemy.attackTimer > 0.55) continue;
       if ((enemy.x - _playerX).abs() > 820) continue;
       final charge = 1 - enemy.attackTimer / 0.55;
-      canvas.drawCircle(
-        ui.Offset(enemy.x, enemy.y - 95),
-        14 + charge * 26,
-        ui.Paint()
-          ..color = const ui.Color(
-            0xffff5b2e,
-          ).withValues(alpha: 0.25 + charge * 0.5)
-          ..maskFilter = const ui.MaskFilter.blur(ui.BlurStyle.normal, 10),
+      _glows.add(
+        enemy.x,
+        enemy.y - 95,
+        30 + charge * 44,
+        glowColor(0xff5b2e, 0.4 + charge * 0.6),
       );
     }
     for (final shot in _bossShots) {
-      if ((shot.x - _cameraX).abs() > 900) continue;
+      if ((shot.x - _cameraX).abs() > 1100) continue;
       final angle = math.atan2(shot.vy, shot.vx);
+      final tailX = math.cos(angle) * 14;
+      final tailY = math.sin(angle) * 14;
       for (var i = 4; i >= 1; i--) {
-        canvas.drawCircle(
-          ui.Offset(
-            shot.x - math.cos(angle) * i * 14,
-            shot.y - math.sin(angle) * i * 14,
-          ),
-          13 - i * 2.2,
-          ui.Paint()
-            ..color = const ui.Color(
-              0xffff7a2e,
-            ).withValues(alpha: 0.12 * (5 - i)),
+        _glows.add(
+          shot.x - tailX * i,
+          shot.y - tailY * i,
+          26 - i * 4.0,
+          glowColor(0xff7a2e, 0.14 * (5 - i)),
         );
       }
-      canvas.drawCircle(
-        ui.Offset(shot.x, shot.y),
-        24,
-        ui.Paint()..color = const ui.Color(0xffff4a1c).withValues(alpha: 0.3),
-      );
-      canvas.drawCircle(
-        ui.Offset(shot.x, shot.y),
-        12,
-        ui.Paint()..color = const ui.Color(0xffff8a3c),
-      );
-      canvas.drawCircle(
-        ui.Offset(shot.x, shot.y),
-        6,
-        ui.Paint()..color = const ui.Color(0xfffff2b0),
-      );
+      _glows.add(shot.x, shot.y, 40, glowColor(0xff4a1c, 0.8));
+      _glows.add(shot.x, shot.y, 18, glowColor(0xfff2b0, 1));
     }
   }
 
@@ -3206,7 +3537,6 @@ class VenomcoilGame extends FlameGame with KeyboardEvents {
     ui.Canvas canvas,
     double top,
     double height,
-    List<String> palette,
   ) {
     final t = _clock;
     final wallTop = top - 250;
@@ -3302,9 +3632,15 @@ class VenomcoilGame extends FlameGame with KeyboardEvents {
       crest,
       ui.Paint()
         ..style = ui.PaintingStyle.stroke
-        ..strokeWidth = 4
-        ..color = const ui.Color(0xfffff0a8)
-        ..maskFilter = const ui.MaskFilter.blur(ui.BlurStyle.normal, 2),
+        ..strokeWidth = 7
+        ..color = const ui.Color(0x55fff0a8),
+    );
+    canvas.drawPath(
+      crest,
+      ui.Paint()
+        ..style = ui.PaintingStyle.stroke
+        ..strokeWidth = 3
+        ..color = const ui.Color(0xfffff0a8),
     );
 
     // Bubbles popping on the surface and embers drifting upward.
@@ -3312,13 +3648,11 @@ class VenomcoilGame extends FlameGame with KeyboardEvents {
       final seed = i * 91.7;
       final x = _cameraX - 700 + ((seed * 13.1 + t * (18 + i % 4 * 7)) % 1900);
       final pop = (t * 0.6 + i * 0.37) % 1;
-      canvas.drawCircle(
-        ui.Offset(x, _lavaY + 4 - math.sin(pop * math.pi) * 10),
-        3 + (i % 3) * 1.5 * math.sin(pop * math.pi),
-        ui.Paint()
-          ..color = const ui.Color(
-            0xffffe08a,
-          ).withValues(alpha: 0.85 * (1 - pop)),
+      _glows.add(
+        x,
+        _lavaY + 4 - math.sin(pop * math.pi) * 10,
+        7 + (i % 3) * 3 * math.sin(pop * math.pi),
+        glowColor(0xffe08a, 0.85 * (1 - pop)),
       );
     }
     for (var i = 0; i < 34; i++) {
@@ -3326,16 +3660,11 @@ class VenomcoilGame extends FlameGame with KeyboardEvents {
       final life = (t * (0.18 + i % 5 * 0.04) + seed) % 1;
       final x =
           _cameraX - 700 + ((seed * 31.7) % 1900) + math.sin(t * 2 + seed) * 22;
-      final y = _lavaY - life * (260 + i % 4 * 70);
-      canvas.drawCircle(
-        ui.Offset(x, y),
-        1.6 + (i % 3) * 0.8,
-        ui.Paint()
-          ..color =
-              (i % 2 == 0
-                      ? const ui.Color(0xffffb347)
-                      : const ui.Color(0xffff5a1f))
-                  .withValues(alpha: (1 - life) * 0.9),
+      _glows.add(
+        x,
+        _lavaY - life * (260 + i % 4 * 70),
+        4.5 + (i % 3) * 1.8,
+        glowColor(i.isEven ? 0xffb347 : 0xff5a1f, (1 - life) * 0.9),
       );
     }
     // Embers flying off the advancing wall.
@@ -3343,13 +3672,11 @@ class VenomcoilGame extends FlameGame with KeyboardEvents {
       final seed = i * 43.9;
       final life = (t * (0.3 + i % 4 * 0.06) + seed) % 1;
       final y = wallTop + ((seed * 17.3) % (wallBottom - wallTop));
-      canvas.drawCircle(
-        ui.Offset(edge + life * 150, y - life * 40),
-        2 + (i % 2),
-        ui.Paint()
-          ..color = const ui.Color(
-            0xffffc15b,
-          ).withValues(alpha: (1 - life) * 0.85),
+      _glows.add(
+        edge + life * 150,
+        y - life * 40,
+        5.0 + (i % 2) * 2,
+        glowColor(0xffc15b, (1 - life) * 0.85),
       );
     }
   }
@@ -3378,7 +3705,8 @@ class VenomcoilGame extends FlameGame with KeyboardEvents {
       col = 2;
       squash = 1 - _coil * 0.2;
     } else if (!_grounded) {
-      row = 2;
+      // The flat dash row reads as a much smaller snake in the air.
+      row = 1;
       tilt = _inUpdraft ? -0.22 : (_velocityY / 1600).clamp(-0.22, 0.22);
     } else if (_velocityX.abs() > 330) {
       row = 2;
@@ -3409,6 +3737,25 @@ class VenomcoilGame extends FlameGame with KeyboardEvents {
         squash = 1 - 0.05 * lunge;
       }
     }
+    final skinRgb = _skinRgb;
+    _glows.add(
+      _playerX,
+      _playerY - 52,
+      92 + _coil * 70,
+      glowColor(skinRgb, 0.1 + _coil * 0.45),
+    );
+    if (_grounded && _velocityX.abs() > 330 && (_clock * 30).floor().isEven) {
+      _particles.burst(
+        _playerX - _playerDirection * 60,
+        _playerY - 8,
+        skinRgb,
+        count: 1,
+        speed: 40,
+        life: 0.36,
+        size: 12,
+        gravity: -60,
+      );
+    }
     final blink = _invulnerable > 0 && (_invulnerable * 14).floor().isEven;
     _spritePaint.color = ui.Color.fromRGBO(255, 255, 255, blink ? 0.38 : 1);
     canvas.save();
@@ -3417,13 +3764,18 @@ class VenomcoilGame extends FlameGame with KeyboardEvents {
     canvas.rotate(tilt);
     canvas.scale(stretch, squash);
     final src = sheet.content(col, row);
-    final scale = 192 / sheet.cellWidth;
+    final scale = 192 / sheet.cellWidth * sheet.poseScale(row);
     final width = src.width * scale;
     final height = src.height * scale;
     canvas.drawImageRect(
       sheet.image,
       src,
-      ui.Rect.fromLTWH(-width / 2, -height, width, height),
+      ui.Rect.fromLTWH(
+        -width / 2,
+        -height + sheet.footGap(row) * scale,
+        width,
+        height,
+      ),
       _spritePaint,
     );
     if (spit >= 0) {
@@ -3450,7 +3802,7 @@ class VenomcoilGame extends FlameGame with KeyboardEvents {
           ..strokeCap = ui.StrokeCap.round,
       );
       final burst = math.sin(spit * math.pi);
-      final glow = VenomcoilGame.skinColors[_skinIndex.clamp(0, 9)];
+      final glow = skinColors[_skinIndex.clamp(0, 9)];
       canvas.drawCircle(
         mouth + const ui.Offset(14, 3),
         5 + burst * 18,
@@ -3482,7 +3834,15 @@ class VenomcoilGame extends FlameGame with KeyboardEvents {
   @override
   void onRemove() {
     _clearPlatformPictures();
+    _store.release(_stageFiles);
+    _store.release(_skinSheetFiles);
+    _stageFiles = {};
+    _skinSheetFiles = {};
     hud.dispose();
+    momentumMeter.dispose();
+    coilMeter.dispose();
+    attackCooldownMeter.dispose();
+    venomCooldownMeter.dispose();
     super.onRemove();
   }
 }

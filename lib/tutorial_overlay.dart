@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 
+import 'movement_joystick.dart';
 import 'ui_kit.dart';
 import 'venomcoil_game.dart';
 
@@ -97,192 +98,148 @@ class _TutorialOverlayState extends State<TutorialOverlay> {
     }
   }
 
+  Widget _art(_TutorialStep step, double side) => SizedBox(
+    width: side,
+    height: side,
+    child: CustomPaint(
+      painter: const MedallionPainter(),
+      child: Padding(
+        padding: EdgeInsets.all(side * 0.17),
+        child: FittedBox(child: step.art),
+      ),
+    ),
+  );
+
   @override
   Widget build(BuildContext context) {
-    final safe = safeInsets(context, extra: 6);
     final last = _page == _steps.length - 1;
-    return Container(
-      color: const Color(0xd9030d0a),
-      padding: safe,
-      child: Center(
-        child: ConstrainedBox(
-          constraints: const BoxConstraints(maxWidth: 560, maxHeight: 470),
-          child: Container(
-            padding: const EdgeInsets.fromLTRB(20, 14, 20, 18),
-            decoration: BoxDecoration(
-              color: Palette.panel.withValues(alpha: 0.97),
-              borderRadius: BorderRadius.circular(26),
-              border: Border.all(
-                color: Palette.panelLine.withValues(alpha: 0.65),
-                width: 1.4,
+    final sideways = MediaQuery.sizeOf(context).height < 520;
+    return ModalVeil(
+      extra: 4,
+      color: const Color(0xd9020605),
+      child: ConstrainedBox(
+        constraints: const BoxConstraints(maxWidth: 600, maxHeight: 470),
+        child: OrnatePanel(
+          padding: const EdgeInsets.fromLTRB(22, 13, 22, 14),
+          child: Column(
+            children: [
+              Row(
+                children: [
+                  Text(
+                    'CARA MAIN',
+                    style: Ts.head(12, color: Palette.leafBright, spacing: 2.6),
+                  ),
+                  const Spacer(),
+                  GestureDetector(
+                    behavior: HitTestBehavior.opaque,
+                    onTap: () {
+                      UiKit.onTap?.call();
+                      widget.game.closeTutorial();
+                    },
+                    child: Plaque(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 13,
+                        vertical: 6,
+                      ),
+                      child: Text(
+                        'LEWATI  ›',
+                        style: Ts.head(11.5, color: Palette.gold),
+                      ),
+                    ),
+                  ),
+                ],
               ),
-              boxShadow: [
-                BoxShadow(
-                  color: const Color(0xff45df5a).withValues(alpha: 0.14),
-                  blurRadius: 40,
-                ),
-              ],
-            ),
-            child: Column(
-              children: [
-                Row(
-                  children: [
-                    const Text(
-                      'CARA MAIN',
-                      style: TextStyle(
-                        fontSize: 11,
-                        letterSpacing: 2.4,
-                        fontWeight: FontWeight.w900,
-                        color: Palette.leafBright,
-                      ),
-                    ),
-                    const Spacer(),
-                    GestureDetector(
-                      behavior: HitTestBehavior.opaque,
-                      onTap: () {
-                        UiKit.onTap?.call();
-                        widget.game.closeTutorial();
-                      },
-                      child: Container(
-                        padding: const EdgeInsets.symmetric(
-                          horizontal: 14,
-                          vertical: 8,
-                        ),
-                        decoration: BoxDecoration(
-                          borderRadius: BorderRadius.circular(99),
-                          border: Border.all(
-                            color: Palette.gold.withValues(alpha: 0.6),
-                          ),
-                        ),
-                        child: const Text(
-                          'LEWATI  ›',
-                          style: TextStyle(
-                            fontSize: 12,
-                            letterSpacing: 1.2,
-                            fontWeight: FontWeight.w900,
-                            color: Palette.gold,
-                          ),
-                        ),
-                      ),
-                    ),
-                  ],
-                ),
-                Expanded(
-                  child: PageView.builder(
-                    controller: _controller,
-                    itemCount: _steps.length,
-                    onPageChanged: (value) => setState(() => _page = value),
-                    itemBuilder: (context, index) {
-                      final step = _steps[index];
-                      final text = Column(
-                        mainAxisSize: MainAxisSize.min,
-                        crossAxisAlignment: CrossAxisAlignment.start,
+              Expanded(
+                child: PageView.builder(
+                  controller: _controller,
+                  itemCount: _steps.length,
+                  onPageChanged: (value) => setState(() => _page = value),
+                  itemBuilder: (context, index) {
+                    final step = _steps[index];
+                    // Phones are played sideways: art beside the text.
+                    if (sideways) {
+                      return Row(
                         children: [
-                          Text(
-                            '${index + 1}/${_steps.length}  ${step.title}',
-                            style: const TextStyle(
-                              fontSize: 19,
-                              fontWeight: FontWeight.w900,
-                              letterSpacing: 0.8,
-                              color: Palette.cream,
-                            ),
-                          ),
-                          const SizedBox(height: 8),
-                          Text(
-                            step.body,
-                            style: const TextStyle(
-                              fontSize: 13,
-                              height: 1.4,
-                              color: Palette.mist,
+                          _art(step, 122),
+                          const SizedBox(width: 18),
+                          Expanded(
+                            child: SingleChildScrollView(
+                              child: Padding(
+                                padding: const EdgeInsets.symmetric(
+                                  vertical: 6,
+                                ),
+                                child: Column(
+                                  mainAxisSize: MainAxisSize.min,
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    GradientText(
+                                      step.title,
+                                      colors: const [
+                                        Palette.goldBright,
+                                        Palette.gold,
+                                      ],
+                                      style: Ts.head(19, spacing: 1),
+                                    ),
+                                    const SizedBox(height: 7),
+                                    Text(step.body, style: Ts.body(14.5)),
+                                  ],
+                                ),
+                              ),
                             ),
                           ),
                         ],
                       );
-                      // Phones are played sideways: art beside the text.
-                      if (MediaQuery.sizeOf(context).height < 520) {
-                        return Row(
-                          children: [
-                            SizedBox(
-                              width: 140,
-                              child: FittedBox(child: step.art),
-                            ),
-                            const SizedBox(width: 14),
-                            Expanded(
-                              child: SingleChildScrollView(
-                                child: Padding(
-                                  padding: const EdgeInsets.symmetric(
-                                    vertical: 8,
-                                  ),
-                                  child: text,
-                                ),
-                              ),
-                            ),
-                          ],
-                        );
-                      }
-                      return SingleChildScrollView(
-                        child: Column(
-                          children: [
-                            const SizedBox(height: 6),
-                            SizedBox(
-                              height: 130,
-                              child: FittedBox(child: step.art),
-                            ),
-                            const SizedBox(height: 14),
-                            Text(
-                              step.title,
-                              textAlign: TextAlign.center,
-                              style: const TextStyle(
-                                fontSize: 22,
-                                fontWeight: FontWeight.w900,
-                                letterSpacing: 0.8,
-                                color: Palette.cream,
-                              ),
-                            ),
-                            const SizedBox(height: 10),
-                            Text(
-                              step.body,
-                              textAlign: TextAlign.center,
-                              style: const TextStyle(
-                                fontSize: 13.5,
-                                height: 1.42,
-                                color: Palette.mist,
-                              ),
-                            ),
-                          ],
-                        ),
-                      );
-                    },
-                  ),
-                ),
-                const SizedBox(height: 10),
-                Row(
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  children: [
-                    for (var i = 0; i < _steps.length; i++)
-                      AnimatedContainer(
-                        duration: const Duration(milliseconds: 200),
-                        margin: const EdgeInsets.symmetric(horizontal: 3),
-                        width: i == _page ? 22 : 8,
-                        height: 8,
-                        decoration: BoxDecoration(
-                          borderRadius: BorderRadius.circular(99),
-                          color: i == _page
-                              ? Palette.leafBright
-                              : const Color(0x6678a070),
-                        ),
+                    }
+                    return SingleChildScrollView(
+                      child: Column(
+                        children: [
+                          const SizedBox(height: 8),
+                          _art(step, 130),
+                          const SizedBox(height: 12),
+                          GradientText(
+                            step.title,
+                            colors: const [Palette.goldBright, Palette.gold],
+                            style: Ts.head(22, spacing: 1),
+                          ),
+                          const SizedBox(height: 8),
+                          Text(
+                            step.body,
+                            textAlign: TextAlign.center,
+                            style: Ts.body(15),
+                          ),
+                        ],
                       ),
-                  ],
+                    );
+                  },
                 ),
-                const SizedBox(height: 14),
-                GameButton(
-                  label: last ? 'MULAI MAIN' : 'LANJUT',
-                  style: GameButtonStyle.primary,
-                  height: 52,
-                  onTap: _next,
-                ),
-              ],
-            ),
+              ),
+              const SizedBox(height: 6),
+              Row(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  for (var i = 0; i < _steps.length; i++)
+                    AnimatedContainer(
+                      duration: const Duration(milliseconds: 180),
+                      margin: const EdgeInsets.symmetric(horizontal: 4),
+                      width: i == _page ? 22 : 8,
+                      height: 6,
+                      decoration: BoxDecoration(
+                        borderRadius: BorderRadius.circular(2),
+                        color: i == _page
+                            ? Palette.gold
+                            : const Color(0x55e9c77d),
+                      ),
+                    ),
+                ],
+              ),
+              const SizedBox(height: 9),
+              GameButton(
+                label: last ? 'MULAI MAIN' : 'LANJUT',
+                style: GameButtonStyle.primary,
+                height: 46,
+                onTap: _next,
+              ),
+            ],
           ),
         ),
       ),
@@ -304,6 +261,9 @@ class _JoystickArtState extends State<_JoystickArt>
     vsync: this,
     duration: const Duration(milliseconds: 2400),
   )..repeat(reverse: true);
+  late final Animation<double> _offset = _c.drive(
+    Tween<double>(begin: -32, end: 32).chain(CurveTween(curve: Curves.easeInOut)),
+  );
 
   @override
   void dispose() {
@@ -312,40 +272,12 @@ class _JoystickArtState extends State<_JoystickArt>
   }
 
   @override
-  Widget build(BuildContext context) => AnimatedBuilder(
-    animation: _c,
-    builder: (context, _) {
-      final dx = (Curves.easeInOut.transform(_c.value) * 2 - 1) * 28;
-      return Container(
-        width: 120,
-        height: 120,
-        decoration: BoxDecoration(
-          shape: BoxShape.circle,
-          color: const Color(0xbb101d19),
-          border: Border.all(color: const Color(0x995e7755), width: 2),
-        ),
-        child: Stack(
-          alignment: Alignment.center,
-          children: [
-            const Positioned(left: 4, child: AtlasIcon(Hud.left, size: 30)),
-            const Positioned(right: 4, child: AtlasIcon(Hud.right, size: 30)),
-            Transform.translate(
-              offset: Offset(dx, 0),
-              child: Container(
-                width: 50,
-                height: 50,
-                decoration: BoxDecoration(
-                  shape: BoxShape.circle,
-                  gradient: const RadialGradient(
-                    colors: [Color(0xff73bf59), Color(0xff294f33)],
-                  ),
-                  border: Border.all(color: const Color(0xffa9dc81), width: 2),
-                ),
-              ),
-            ),
-          ],
-        ),
-      );
-    },
+  Widget build(BuildContext context) => SizedBox(
+    width: 120,
+    height: 120,
+    child: CustomPaint(
+      painter: const JoystickBasePainter(),
+      foregroundPainter: JoystickThumbPainter(_offset),
+    ),
   );
 }

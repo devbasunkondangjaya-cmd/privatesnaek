@@ -93,6 +93,22 @@ void main() {
     expect(game.debugPlayerState.projectiles, 1);
   });
 
+  test('respawning in the lava chase area does not die again at once', () async {
+    final game = await playableGame();
+    await game.selectArea(19);
+    game.startOrResume();
+    game.setMoveAxis(.01);
+    // Stand still until the advancing lava catches the snake.
+    for (var i = 0; i < 60 * 60 && game.hud.value.overlay != 'death'; i++) {
+      game.update(1 / 60);
+    }
+    expect(game.hud.value.overlay, 'death');
+    game.retry();
+    game.setMoveAxis(.01);
+    advance(game, 1);
+    expect(game.hud.value.overlay, isNull);
+  });
+
   test('menu starts a playable area and renders moving gameplay', () async {
     SharedPreferences.setMockInitialValues({});
     final game = VenomcoilGame(await SaveData.load());
@@ -133,16 +149,25 @@ void main() {
           find.byType(GameWidget<VenomcoilGame>),
         )
         .game!;
-    await tester.runAsync(() => game.loaded);
-    await tester.pump();
+    // Art decoding finishes on real time but resumes inside the fake-time zone,
+    // so keep pumping while waiting for it.
+    for (var i = 0; i < 500 && !game.isLoaded; i++) {
+      await tester.runAsync(
+        () => Future<void>.delayed(const Duration(milliseconds: 20)),
+      );
+      await tester.pump();
+    }
     await tester.pump();
     expect(find.text('MAIN'), findsOneWidget);
     await tester.tap(find.text('MAIN'));
     await tester.pump();
-    await tester.runAsync(() async {
-      await Future<void>.delayed(const Duration(milliseconds: 100));
-    });
-    await tester.pump();
+    // The area's art now loads on demand, behind the loading veil.
+    for (var i = 0; i < 500 && game.hud.value.overlay != 'tutorial'; i++) {
+      await tester.runAsync(
+        () => Future<void>.delayed(const Duration(milliseconds: 20)),
+      );
+      await tester.pump();
+    }
     // Every run opens with the skippable how-to-play cards.
     expect(game.hud.value.overlay, 'tutorial');
     expect(find.text('CARA MAIN'), findsOneWidget);

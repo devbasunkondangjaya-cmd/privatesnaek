@@ -78,9 +78,57 @@ class SheetInfo {
         ),
     ];
     _rowMax.clear();
+    _inkAreas = packed.inkAreas;
+    _footGaps = packed.footGaps;
   }
 
   static const double overflowScale = 1;
+
+  Int32List? _inkAreas;
+  Int32List? _footGaps;
+
+  /// Empty space between a row's frames and the body's lowest solid pixel, in
+  /// sheet pixels. Averaged over the row so the snake does not bob per frame.
+  double footGap(int row) {
+    final gaps = _footGaps;
+    final areas = _inkAreas;
+    if (gaps == null || areas == null) return 0;
+    var sum = 0, frames = 0;
+    for (var c = 0; c < cols; c++) {
+      final f = row * cols + c;
+      if (areas[f] > 0) {
+        sum += gaps[f];
+        frames++;
+      }
+    }
+    return frames == 0 ? 0 : sum / frames;
+  }
+
+  /// Grows a row's poses until the character looks as big as in the standing
+  /// row: flat poses fill the same cell with far less body. Measured on the
+  /// visible pixels, because skins differ. 1 for sheets without measurements.
+  double poseScale(int row) {
+    final areas = _inkAreas;
+    if (areas == null) return 1;
+    double average(int r) {
+      var sum = 0, frames = 0;
+      for (var c = 0; c < cols; c++) {
+        final area = areas[r * cols + c];
+        if (area > 0) {
+          sum += area;
+          frames++;
+        }
+      }
+      return frames == 0 ? 0 : sum / frames;
+    }
+
+    final own = average(row);
+    if (own <= 0) return 1;
+    return math.sqrt(average(0) / own).clamp(1.0, maxPoseScale);
+  }
+
+  /// Keeps long flat poses from growing wider than the action can read.
+  static const double maxPoseScale = 1.35;
 
   /// Largest content size across a row; used as a stable scale reference so
   /// animations don't pulse in size from frame to frame.
@@ -112,6 +160,29 @@ class ImageStore {
   /// Bumped whenever something finishes loading, so widgets can rebuild.
   final ValueNotifier<int> revision = ValueNotifier(0);
 
+  // Upper bounds for decoding; [fitToScreen] lowers them on smaller displays,
+  // since pixels finer than the screen can show only cost texture memory.
+  int _maxCellWidth = 320;
+  int _maxBackdropWidth = 1536;
+
+  /// Sizes decoded art for the display. A sprite's largest on-screen size is
+  /// about 192 of the 720 world units that span the short side.
+  void fitToScreen(double shortSidePx, double longSidePx) {
+    // Early in startup a view can still report 0x0; keep the sharp defaults.
+    if (shortSidePx <= 0) return;
+    _maxCellWidth = (shortSidePx / 720 * 192).ceil().clamp(192, 320);
+    _maxBackdropWidth = longSidePx.ceil().clamp(960, 1536);
+  }
+
+  /// What is decoded right now, for tests and memory checks.
+  Iterable<String> get loadedFiles => _sheets.keys;
+
+  /// Approximate decoded size of everything held, in bytes.
+  int get loadedBytes => _sheets.values.fold(
+    0,
+    (sum, sheet) => sum + sheet.image.width * sheet.image.height * 4,
+  );
+
   ui.Image? operator [](String file) => _sheets[file]?.image;
   SheetInfo? sheet(String file) => _sheets[file];
 
@@ -130,10 +201,16 @@ class ImageStore {
       var image = _sheets[file]?.image;
       if (image == null) {
         final data = await rootBundle.load('assets/images/$file');
-        final maxCellWidth = file.startsWith('boss_') ? 384 : 320;
+        final maxCellWidth = file.startsWith('boss_')
+            ? (_maxCellWidth * 1.2).round()
+            : _maxCellWidth;
         final codec = await ui.instantiateImageCodec(
           data.buffer.asUint8List(),
-          targetWidth: cols > 1 ? cols * maxCellWidth : null,
+          targetWidth: cols > 1
+              ? cols * maxCellWidth
+              : file.contains('_bg')
+              ? _maxBackdropWidth
+              : null,
           allowUpscaling: false,
         );
         image = (await codec.getNextFrame()).image;
@@ -173,7 +250,14 @@ class _PoseJob {
 }
 
 class _PackedPoses {
-  const _PackedPoses(this.pixels, this.width, this.height, this.frames);
+  const _PackedPoses(
+    this.pixels,
+    this.width,
+    this.height,
+    this.frames,
+    this.inkAreas,
+    this.footGaps,
+  );
 
   final Uint8List pixels;
   final int width;
@@ -181,6 +265,12 @@ class _PackedPoses {
 
   /// left, top, width, height of every frame in the atlas, row by row.
   final Float64List frames;
+
+  /// How many solid pixels each frame has, row by row.
+  final Int32List inkAreas;
+
+  /// Rows between each frame's lowest pixel and its lowest solid pixel.
+  final Int32List footGaps;
 }
 
 /// Runs off the UI thread: labels the artwork, then repacks it pose by pose.
@@ -246,6 +336,8 @@ _PackedPoses _separatePoses(_PoseJob job) {
   }
 
   final count = cols * rows;
+  final inkAreas = Int32List(count);
+  final inkBottoms = Int32List(count);
   final left = List.filled(count, w), top = List.filled(count, h);
   final right = List.filled(count, 0), bottom = List.filled(count, 0);
   for (var y = 0; y < h; y++) {
@@ -253,6 +345,10 @@ _PackedPoses _separatePoses(_PoseJob job) {
       if (src[(y * w + x) * 4 + 3] == 0) continue;
       final f = frameOf(x, y);
       if (f < 0) continue;
+      if (src[(y * w + x) * 4 + 3] >= 128) {
+        inkAreas[f]++;
+        inkBottoms[f] = math.max(inkBottoms[f], y + 1);
+      }
       left[f] = math.min(left[f], x);
       top[f] = math.min(top[f], y);
       right[f] = math.max(right[f], x + 1);
@@ -312,5 +408,9 @@ _PackedPoses _separatePoses(_PoseJob job) {
       out[o + 3] = src[i + 3];
     }
   }
-  return _PackedPoses(out, outW, outH, frames);
+  final footGaps = Int32List(count);
+  for (var f = 0; f < count; f++) {
+    if (inkAreas[f] > 0) footGaps[f] = bottom[f] - inkBottoms[f];
+  }
+  return _PackedPoses(out, outW, outH, frames, inkAreas, footGaps);
 }

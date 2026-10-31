@@ -2,11 +2,30 @@ import 'dart:ui' as ui;
 
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:snake/image_store.dart';
 
 import 'package:snake/level_data.dart';
 
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
+
+  test('moving poses keep the snake as big as when it stands', () async {
+    for (var skin = 1; skin <= 10; skin++) {
+      final file =
+          'skin_${skin.toString().padLeft(2, '0')}_motion_a-transparent.webp';
+      final sheet = (await ImageStore.instance.loadSheet(
+        file,
+        cols: 5,
+        rows: 4,
+      ))!;
+      expect(sheet.poseScale(0), 1, reason: file);
+      for (final row in const [1, 2]) {
+        expect(sheet.poseScale(row), inInclusiveRange(1, 1.35), reason: file);
+        expect(sheet.footGap(row), greaterThanOrEqualTo(0), reason: file);
+      }
+      ImageStore.instance.release([file]);
+    }
+  });
 
   test('every character and enemy sprite sheet has usable frames', () async {
     final files = <String>{

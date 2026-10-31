@@ -10,7 +10,8 @@ class GameAudio {
   GameAudio._();
   static final GameAudio instance = GameAudio._();
 
-  static const _files = [
+  // Music is left out on purpose: each track is cached only while it plays.
+  static const _effectFiles = [
     'sfx_ui_click.mp3',
     'sfx_jump.mp3',
     'sfx_land.mp3',
@@ -29,11 +30,6 @@ class GameAudio {
     'sfx_wind.mp3',
     'sfx_checkpoint.mp3',
     'sfx_complete.mp3',
-    'bgm_menu.mp3',
-    'bgm_world1.mp3',
-    'bgm_world2.mp3',
-    'bgm_world3.mp3',
-    'bgm_world4.mp3',
   ];
 
   /// Never take audio focus: a focus-grabbing effect pauses the music on
@@ -48,7 +44,7 @@ class GameAudio {
   String? _pendingMusic;
   Future<void> _musicTransition = Future.value();
   bool _ready = false;
-  final Map<String, AudioPool> _effectPools = {};
+  final Map<String, Future<AudioPool>> _effectPools = {};
   static const double _musicGain = 0.55;
 
   double get volume => const [0.0, 0.35, 1.0][level.value];
@@ -56,24 +52,10 @@ class GameAudio {
   Future<void> init(int savedLevel) async {
     level.value = savedLevel.clamp(0, 2);
     try {
-      await FlameAudio.audioCache.loadAll(_files);
-      for (final name in [
-        'ui_click',
-        'jump',
-        'attack',
-        'venom',
-        'hit',
-        'hurt',
-        'death',
-        'complete',
-      ]) {
+      await FlameAudio.audioCache.loadAll(_effectFiles);
+      for (final name in ['ui_click', 'jump', 'attack', 'venom', 'hit']) {
         try {
-          _effectPools[name] = await FlameAudio.createPool(
-            'sfx_$name.mp3',
-            minPlayers: name == 'venom' ? 2 : 1,
-            maxPlayers: 3,
-            audioContext: _mixContext,
-          );
+          await _pool(name);
         } catch (_) {
           // Other effects can still play when one pool is unavailable.
         }
@@ -95,19 +77,22 @@ class GameAudio {
     unawaited(_playEffect(name, volume));
   }
 
-  Future<void> _playEffect(String name, double effectVolume) async {
-    try {
-      final pool = _effectPools[name];
-      if (pool != null) {
-        await pool.start(volume: effectVolume);
-        return;
-      }
-      await FlameAudio.play(
+  /// Every effect plays through a small reusable pool, built on first use;
+  /// creating a fresh native player per sound caused hitches mid-game.
+  Future<AudioPool> _pool(String name) => _effectPools[name] ??=
+      FlameAudio.createPool(
         'sfx_$name.mp3',
-        volume: effectVolume,
+        minPlayers: name == 'venom' ? 2 : 1,
+        maxPlayers: 3,
         audioContext: _mixContext,
       );
-    } catch (_) {}
+
+  Future<void> _playEffect(String name, double effectVolume) async {
+    try {
+      await (await _pool(name)).start(volume: effectVolume);
+    } catch (_) {
+      _effectPools.remove(name);
+    }
   }
 
   /// A tap may retry a track blocked by browser autoplay, but never restarts
@@ -125,9 +110,16 @@ class GameAudio {
       if (_music != name) return;
       try {
         await FlameAudio.bgm.stop();
+        // Free the previous track: only the one playing stays cached.
+        final previous = _cachedTrack;
+        if (previous != null && previous != 'bgm_$name.mp3') {
+          await FlameAudio.audioCache.clear(previous);
+          _cachedTrack = null;
+        }
         if (_music != name) return;
         _appliedVolume = -1;
         if (volume > 0) {
+          _cachedTrack = 'bgm_$name.mp3';
           await FlameAudio.bgm.play(
             'bgm_$name.mp3',
             volume: volume * _musicGain,
@@ -147,6 +139,7 @@ class GameAudio {
   }
 
   double _appliedVolume = -1;
+  String? _cachedTrack;
 
   /// Pushes the current volume to the player, only when it actually changed.
   void _syncMusicVolume() {
